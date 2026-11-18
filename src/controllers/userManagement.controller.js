@@ -12,8 +12,9 @@ import { PAYMENT_METHOD, parsePaymentMethod } from "../utils/paymentEnums.js";
 import {
   cancelGatewayTransaction,
   maskJPaymentAcid,
-  stopJPaymentAutoCharge,
 } from "../utils/jpaymentGateway.js";
+import { nextJstDateOnlyString, stopLegacyAutoCharge, stopLegacyAutoCharges } from "../utils/autoChargeStop.js";
+import { parseJstDateTime } from "../utils/jstDate.js";
 import { getPlanAmount } from "../utils/paymentPricing.js";
 import {
   USER_STATUS,
@@ -65,13 +66,7 @@ function parsePositiveInt(v, fallback) {
 }
 
 function parseDateInputToLocalDate(raw) {
-  if (!raw) return null;
-  const s = String(raw).trim();
-  if (!s) return null;
-  const withTime = /^\d{4}-\d{2}-\d{2}$/.test(s) ? `${s}T23:59:59.999` : s;
-  const d = new Date(withTime);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
+  return parseJstDateTime(raw, { endOfDayForDateOnly: true });
 }
 
 function parseNullableDateTime(raw, { endOfDayForDateOnly = false } = {}) {
@@ -336,7 +331,41 @@ export async function adminUpsertUserPayment(req, res) {
       if (body.periodStartAt !== undefined) updates.periodStartAt = periodStartAt;
       if (body.periodEndAt !== undefined) updates.periodEndAt = periodEndAt;
       if (body.paidAt !== undefined) updates.paidAt = paidAt;
+
+      const acidBefore = String(order.recurringToken || "").trim();
+      const turningOffAutoRenew = parsedAutoRenew === false && order.autoRenew !== false;
+      const leavingPaid =
+        status != null &&
+        status !== order.status &&
+        order.status === "paid" &&
+        ["cancelled", "expired", "failed"].includes(status);
+      const shouldStopGateway =
+        (turningOffAutoRenew || leavingPaid) &&
+        order.paymentMethod === PAYMENT_METHOD.CREDIT_CARD &&
+        Boolean(acidBefore) &&
+        !order.stopRequested;
+
       await order.update(updates);
+      if (shouldStopGateway) {
+        const aid = String(process.env.JPAYMENT_AID || "").trim();
+        const stopResult = await stopLegacyAutoCharge({
+          aid,
+          legacyForStop: {
+            acid: acidBefore,
+            legacyOrderId: order.id,
+            userId: order.userId,
+          },
+          source: "admin/upsert-payment",
+          expectedUserId: order.userId,
+        });
+        if (!stopResult.ok) {
+          console.error("[ADMIN PAYMENT] auto-charge stop failed; retry scheduled", {
+            orderId: order.id,
+            userId: order.userId,
+            reason: stopResult.reason || null,
+          });
+        }
+      }
       await order.reload();
     }
     await refreshAndSyncUserSubscriptionState(targetUser.id);
@@ -380,14 +409,50 @@ export async function adminSetUserAutoRenew(req, res) {
       return res.status(404).json({ error: "No active paid subscription found for user" });
     }
 
+    const acid = String(order.recurringToken || "").trim();
+    const needsGatewayStop =
+      parsedAutoRenew === false &&
+      order.paymentMethod === PAYMENT_METHOD.CREDIT_CARD &&
+      Boolean(acid) &&
+      !order.stopRequested;
+
     await order.update({ autoRenew: parsedAutoRenew });
+
+    let autoRenewStop = null;
+    if (needsGatewayStop) {
+      const aid = String(process.env.JPAYMENT_AID || "").trim();
+      autoRenewStop = await stopLegacyAutoCharge({
+        aid,
+        legacyForStop: { acid, legacyOrderId: order.id, userId: order.userId },
+        source: "admin/set-auto-renew",
+        expectedUserId: order.userId,
+      });
+    } else if (
+      parsedAutoRenew === false &&
+      order.paymentMethod === PAYMENT_METHOD.CREDIT_CARD &&
+      !acid
+    ) {
+      console.warn("[ADMIN AUTO_RENEW] no acid; local flag only", { orderId: order.id, userId });
+    }
+
     await order.reload();
     await refreshAndSyncUserSubscriptionState(targetUser.id);
+
+    if (autoRenewStop && autoRenewStop.ok === false) {
+      return res.status(502).json({
+        error: "Auto renew flag was updated, but stopping auto-charge at the gateway failed. A retry was scheduled.",
+        stopRetryScheduled: Boolean(autoRenewStop.retryLater),
+        autoRenewStop,
+        user: targetUser,
+        payment: toPaymentProfilePayload(order),
+      });
+    }
 
     return res.json({
       message: "Auto renew updated",
       user: targetUser,
       payment: toPaymentProfilePayload(order),
+      ...(autoRenewStop ? { autoRenewStop } : {}),
     });
   } catch (err) {
     console.error("❌ adminSetUserAutoRenew error:", err);
@@ -518,6 +583,7 @@ export async function adminCreateManualPaymentOrderForUser(req, res) {
       return res.status(400).json({ error: "paidAt must be valid datetime" });
     }
 
+    const stopTargets = [];
     const created = await sequelize.transaction(async (t) => {
       const subscriptionId = makeSubscriptionId(userId);
 
@@ -527,6 +593,21 @@ export async function adminCreateManualPaymentOrderForUser(req, res) {
           transaction: t,
           lock: t.LOCK.UPDATE,
         });
+        for (const prior of priorPaid) {
+          const acid = String(prior.recurringToken || "").trim();
+          if (
+            prior.paymentMethod === PAYMENT_METHOD.CREDIT_CARD &&
+            acid &&
+            !prior.stopRequested
+          ) {
+            stopTargets.push({
+              acid,
+              tid: String(prior.gid || "").trim(),
+              legacyOrderId: prior.id,
+              userId: prior.userId,
+            });
+          }
+        }
         if (priorPaid.length) {
           await PaymentOrder.update(
             {
@@ -567,6 +648,20 @@ export async function adminCreateManualPaymentOrderForUser(req, res) {
       return order;
     });
 
+    const aid = String(process.env.JPAYMENT_AID || "").trim();
+    const supersededAutoChargeStops = await stopLegacyAutoCharges(stopTargets, {
+      aid,
+      source: "admin/create-manual-order",
+      expectedUserId: Number(userId),
+    });
+    const stopFailed = supersededAutoChargeStops.some((r) => r && r.ok === false);
+    if (stopFailed) {
+      console.error("[ADMIN PAYMENT] superseded auto-charge stop failed; retry scheduled", {
+        userId,
+        failed: supersededAutoChargeStops.filter((r) => r && r.ok === false).length,
+      });
+    }
+
     await refreshAndSyncUserSubscriptionState(targetUser.id);
 
     return res.status(201).json({
@@ -574,6 +669,7 @@ export async function adminCreateManualPaymentOrderForUser(req, res) {
       user: targetUser,
       payment: toPaymentProfilePayload(created),
       paymentMethodOptions: PAYMENT_METHOD_OPTIONS,
+      ...(supersededAutoChargeStops.length ? { supersededAutoChargeStops } : {}),
     });
   } catch (err) {
     console.error("❌ adminCreateManualPaymentOrderForUser error:", err);
@@ -1375,7 +1471,12 @@ export async function adminGatewayRefundPaymentOrder(req, res) {
         ...autoRenewStop,
       });
     } else {
-      autoRenewStop = await stopJPaymentAutoCharge({ aid, acid });
+      autoRenewStop = await stopLegacyAutoCharge({
+        aid,
+        legacyForStop: { acid, legacyOrderId: order.id, userId: order.userId },
+        source: "admin/gateway-refund",
+        expectedUserId: order.userId,
+      });
       if (autoRenewStop.ok) {
         console.log("[GATEWAY_REFUND][AUTO_RENEW_STOP_OK]", {
           action: "AUTO_RENEW_STOP",
@@ -1423,7 +1524,7 @@ export async function adminGatewayRefundPaymentOrder(req, res) {
         gatewayRefund: refundNote,
       }),
       renewFailureCode: stopFailed ? "GATEWAY_REFUNDED_STOP_FAILED" : "GATEWAY_REFUNDED",
-      renewNextRetryAt: null,
+      renewNextRetryAt: stopFailed ? nextJstDateOnlyString() : null,
     });
 
     await order.reload();

@@ -2,7 +2,14 @@ import crypto from "crypto";
 import { Op } from "sequelize";
 import { sequelize } from "../config/db.js";
 import { PaymentOrder } from "../models/paymentOrder.model.js";
-import { verifyJPaymentCallbackQuerySecret } from "../utils/paymentNotify.js";
+import {
+  redactPaymentCallbackQuery,
+  redactPaymentCallbackUrl,
+  verifyJPaymentCallbackQuerySecret,
+} from "../utils/paymentNotify.js";
+import { buildAutoRenewResultPatch } from "../utils/autoRenewRst.js";
+import { stopLegacyAutoCharges } from "../utils/autoChargeStop.js";
+import { parseJstDateTime } from "../utils/jstDate.js";
 import { toPaymentProfilePayload } from "../utils/paymentProfile.js";
 import { refreshAndSyncUserSubscriptionState } from "../middlewares/subscription.middleware.js";
 import { getMinOnlineChargeJpy, getPlanAmount, resolveBilledBaseForProration } from "../utils/paymentPricing.js";
@@ -42,11 +49,8 @@ function buildSubscriptionId(userId) {
 }
 
 const JPAY_LINK_URL = "https://credit.j-payment.co.jp/link/creditcard";
-const JPAY_AUTO_CHARGE_STOP_URL = "https://credit.j-payment.co.jp/gateway/acsgate.aspx";
 const TRANSIENT_ORDER_KEEP_MINUTES = 30;
-const STOP_RETRY_DELAYS_MS = [1000, 3000, 5000];
 const UPGRADE_RENEWAL_GRACE_WINDOW_MS = 5 * 60 * 1000;
-const RECURRING_RESULT_RSTS = new Set(["1", "2", "3", "4", "5"]);
 const LEGACY_IID_PLAN_MAP = {
   "0002yc": { planType: "yearly", accountType: "company" },
   "0002mc": { planType: "monthly", accountType: "company" },
@@ -76,7 +80,8 @@ function makeOpaqueToken(len = 24) {
 }
 
 async function ensureResultToken(order, options = {}) {
-  if (order.resultToken && order.resultTokenExpiresAt && new Date(order.resultTokenExpiresAt) > new Date()) {
+  const expires = parseJstDateTime(order.resultTokenExpiresAt);
+  if (order.resultToken && expires && expires > new Date()) {
     return order.resultToken;
   }
   const token = makeOpaqueToken(12);
@@ -109,119 +114,8 @@ function getBackendPublicBaseUrl(req) {
   return `${proto}://${host}`;
 }
 
-function toDateOnlyString(date) {
-  const d = date instanceof Date ? date : new Date(date);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
-}
-
-function isDuplicateStopResponse(text) {
-  const s = String(text || "").toLowerCase();
-  if (!s) return false;
-  return s.includes("already") || s.includes("duplicate") || s.includes("処理済") || s.includes("既に");
-}
-
-/**
- * Stop legacy auto-charge by server-to-server API call.
- * Spec: POST https://credit.j-payment.co.jp/gateway/acsgate.aspx with aid, acid, cmd=1.
- */
-async function stopLegacyAutoCharge({ aid, legacyForStop, source = "unknown", expectedUserId = null } = {}) {
-  const legacyOrderId = legacyForStop?.legacyOrderId || null;
-  const acid = String(legacyForStop?.acid || "").trim();
-  const userId = legacyForStop?.userId || null;
-  if (!aid || !acid || !legacyOrderId) return { attempted: false };
-
-  const legacyOrder = await PaymentOrder.findByPk(legacyOrderId);
-  if (!legacyOrder) {
-    console.warn("[STOP_RECURRING] legacy order not found", { legacyOrderId, source });
-    return { attempted: false, skipped: true, reason: "legacy_order_not_found" };
-  }
-  if (expectedUserId && Number(legacyOrder.userId) !== Number(expectedUserId)) {
-    console.error("[STOP_RECURRING] user mismatch; abort stop", {
-      source,
-      action: "STOP_RECURRING",
-      legacyOrderId,
-      expectedUserId,
-      actualUserId: legacyOrder.userId,
-    });
-    return { attempted: false, skipped: true, reason: "user_mismatch" };
-  }
-  if (legacyOrder.stopRequested) {
-    console.log("[STOP_RECURRING] skip duplicate request", {
-      source,
-      legacyOrderId,
-      userId: legacyOrder.userId || userId,
-      acid: `${acid.slice(0, 4)}***${acid.slice(-2)}`,
-      action: "STOP_RECURRING",
-      reason: "already_requested",
-    });
-    return { attempted: false, skipped: true, reason: "already_requested" };
-  }
-
-  const body = new URLSearchParams({
-    aid: String(aid).trim(),
-    acid,
-    cmd: "1",
-  });
-
-  let lastResult = null;
-  for (let i = 0; i < STOP_RETRY_DELAYS_MS.length; i += 1) {
-    if (i > 0) {
-      await new Promise((resolve) => setTimeout(resolve, STOP_RETRY_DELAYS_MS[i]));
-    }
-    try {
-      const resp = await fetch(JPAY_AUTO_CHARGE_STOP_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-        },
-        body: body.toString(),
-      });
-      const text = await resp.text();
-      const responseSnippet = String(text || "").slice(0, 400);
-      const hasApiError = !responseSnippet || responseSnippet.includes("ER");
-      const duplicateStop = isDuplicateStopResponse(responseSnippet);
-      const ok = (resp.ok && !hasApiError) || duplicateStop;
-      lastResult = { attempted: true, ok, status: resp.status, responseSnippet };
-      console.log("[STOP_RECURRING] attempt", {
-        action: "STOP_RECURRING",
-        source,
-        attempt: i + 1,
-        legacyOrderId,
-        userId: legacyOrder.userId || userId,
-        acid: `${acid.slice(0, 4)}***${acid.slice(-2)}`,
-        result: lastResult,
-      });
-      if (ok) break;
-    } catch (err) {
-      lastResult = { attempted: true, ok: false, status: null, error: err?.message || String(err) };
-      console.error("[STOP_RECURRING] attempt failed", {
-        action: "STOP_RECURRING",
-        source,
-        attempt: i + 1,
-        legacyOrderId,
-        userId: legacyOrder.userId || userId,
-        acid: `${acid.slice(0, 4)}***${acid.slice(-2)}`,
-        result: lastResult,
-      });
-    }
-  }
-
-  if (lastResult?.ok) {
-    await legacyOrder.update({
-      stopRequested: true,
-      stopRequestedAt: new Date(),
-      renewFailureCode: null,
-      renewNextRetryAt: null,
-    });
-    return lastResult;
-  }
-
-  await legacyOrder.update({
-    renewFailureCode: "STOP_API_FAILED",
-    renewNextRetryAt: toDateOnlyString(Date.now() + 24 * 60 * 60 * 1000),
-  });
-  return { ...(lastResult || { attempted: true, ok: false }), retryLater: true };
+function storedCallbackParams(q) {
+  return JSON.stringify(redactPaymentCallbackQuery(q || {}));
 }
 
 function isGatewayAmountMismatch(order, q) {
@@ -307,7 +201,7 @@ function applyGatewayResultToOrder(order, q, options = {}) {
     tx: toIntOrNull(q.tx),
     sf: toIntOrNull(q.sf),
     ta: toIntOrNull(q.ta),
-    rawParams: JSON.stringify(q),
+    rawParams: storedCallbackParams(q),
     recurringToken: q.acid != null ? String(q.acid).trim() : order.recurringToken,
     paidAt,
     periodStartAt: paidPeriod ? paidPeriod.start : order.periodStartAt,
@@ -334,26 +228,7 @@ function jstPartsFromDate(date) {
 }
 
 function parseDateInputToDate(raw) {
-  if (!raw) return null;
-  if (raw instanceof Date) return Number.isNaN(raw.getTime()) ? null : raw;
-  const s = String(raw).trim();
-  if (!s) return null;
-
-  const m = s.match(
-    /^(\d{4})-(\d{2})-(\d{2})(?:[ T](\d{2})(?::(\d{2})(?::(\d{2}))?)?)?$/
-  );
-  if (m) {
-    const year = Number(m[1]);
-    const month = Number(m[2]);
-    const day = Number(m[3]);
-    const hour = Number(m[4] ?? "0");
-    const minute = Number(m[5] ?? "0");
-    const second = Number(m[6] ?? "0");
-    return dateFromJstParts(year, month, day, hour, minute, second);
-  }
-
-  const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? null : d;
+  return parseJstDateTime(raw);
 }
 
 function lastDayOfMonth(year, month) {
@@ -417,9 +292,7 @@ function buildRecurringRenewalCod(sourceOrder, gid) {
 }
 
 function asValidDate(value) {
-  const d = value instanceof Date ? value : new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
+  return parseJstDateTime(value);
 }
 
 function normalizeCallbackCod(rawCod) {
@@ -545,7 +418,7 @@ async function buildUpgradePricingContext({ userId, planType, accountType, targe
 
 async function handleAutoRenewResultCallback(order, q, transaction) {
   const rst = String(q.rst || "").trim();
-  if (!RECURRING_RESULT_RSTS.has(rst)) {
+  if (!buildAutoRenewResultPatch(order, q)) {
     return order;
   }
   const recurringToken = q.acid != null ? String(q.acid).trim() : "";
@@ -596,7 +469,7 @@ async function handleAutoRenewResultCallback(order, q, transaction) {
   if (order.autoRenew === false) {
     await order.update(
       {
-        rawParams: JSON.stringify(q),
+        rawParams: storedCallbackParams(q),
         renewLastAttemptAt: new Date(),
       },
       { transaction }
@@ -609,21 +482,10 @@ async function handleAutoRenewResultCallback(order, q, transaction) {
   const ec = q.ec != null ? String(q.ec).trim() : null;
   const paidAmount = toIntOrNull(q.am);
 
-  await order.update(
-    {
-      recurringToken: recurringToken || order.recurringToken,
-      renewFailureCode: rst === "1" ? null : ec || `AUTO_RENEW_RST_${rst}`,
-      rawParams: JSON.stringify(q),
-      renewLastAttemptAt: new Date(),
-      renewRetryCount: rst === "1" ? 0 : Number(order.renewRetryCount || 0) + 1,
-      autoRenew: rst === "1" ? order.autoRenew : false,
-      status: rst === "4" ? "cancelled" : order.status,
-      cancelledAt: rst === "4" ? new Date() : order.cancelledAt,
-    },
-    { transaction }
-  );
+  const renewPatch = buildAutoRenewResultPatch(order, q);
+  await order.update(renewPatch.patch, { transaction });
 
-  if (rst !== "1") {
+  if (renewPatch.classified.outcome !== "success") {
     return order;
   }
 
@@ -691,7 +553,7 @@ async function handleAutoRenewResultCallback(order, q, transaction) {
       tx: toIntOrNull(q.tx),
       sf: toIntOrNull(q.sf),
       ta: toIntOrNull(q.ta),
-      rawParams: JSON.stringify(q),
+      rawParams: storedCallbackParams(q),
     },
     { transaction }
   );
@@ -715,7 +577,7 @@ async function handleAutoRenewResultCallback(order, q, transaction) {
  */
 async function deactivateOtherPaidSubscriptions(userId, keepOrderId, transaction) {
   if (!userId || !keepOrderId) {
-    return { legacy: null };
+    return { legacy: null, legacies: [] };
   }
   const oldPaidOrders = await PaymentOrder.findAll({
     where: {
@@ -729,19 +591,34 @@ async function deactivateOtherPaidSubscriptions(userId, keepOrderId, transaction
     lock: transaction?.LOCK?.UPDATE,
   });
   if (!oldPaidOrders.length) {
-    return { legacy: null };
+    return { legacy: null, legacies: [] };
   }
 
   const withToken = oldPaidOrders.filter((o) => String(o?.recurringToken || "").trim());
   const withTokenAndGid = withToken.filter((o) => String(o?.gid || "").trim());
-  // J-Payment stop often needs acid + tid pair from the currently replaced subscription.
-  // oldPaidOrders are DESC by createdAt, so index 0 is the latest legacy package.
-  const primary = withTokenAndGid[0] || withToken[0] || null;
+  const withoutGid = withToken.filter((o) => !String(o?.gid || "").trim());
+  // Prefer acid+gid pairs first (same primary as before), then any remaining acids.
+  const orderedForStop = [...withTokenAndGid, ...withoutGid];
+  const legacies = [];
+  const seenAcids = new Set();
+  for (const o of orderedForStop) {
+    const acid = String(o.recurringToken || "").trim();
+    if (!acid || seenAcids.has(acid)) continue;
+    seenAcids.add(acid);
+    legacies.push({
+      acid,
+      tid: String(o.gid || "").trim(),
+      legacyOrderId: o.id,
+      userId: o.userId,
+    });
+  }
+  const primary = orderedForStop[0] || null;
   if (withToken.length > 1) {
-    console.warn("[PAYMENT] multiple legacy paid orders with recurringToken; pick token+gid if any", {
+    console.warn("[PAYMENT] multiple legacy paid orders with recurringToken; stop each distinct acid", {
       userId,
       keepOrderId,
       chosenOrderId: primary?.id,
+      acidCount: legacies.length,
       orderIds: withToken.map((o) => o.id),
     });
   }
@@ -752,13 +629,7 @@ async function deactivateOtherPaidSubscriptions(userId, keepOrderId, transaction
     });
   }
 
-  const legacy = primary
-    ? {
-        acid: String(primary.recurringToken).trim(),
-        tid: String(primary.gid || "").trim(),
-        legacyOrderId: primary.id,
-      }
-    : null;
+  const legacy = legacies[0] || null;
 
   if (legacy) {
     const acidMasked = `${legacy.acid.slice(0, 4)}***${legacy.acid.slice(-2)}`;
@@ -788,7 +659,7 @@ async function deactivateOtherPaidSubscriptions(userId, keepOrderId, transaction
       transaction,
     }
   );
-  return { legacy };
+  return { legacy, legacies };
 }
 
 /**
@@ -840,11 +711,11 @@ function isVerbosePaymentLogEnabled() {
 }
 
 function logPaymentCallbackSnapshot(req) {
-  const q = req.query || {};
+  const q = redactPaymentCallbackQuery(req.query || {});
   const summary = {
     at: new Date().toISOString(),
     method: req.method,
-    originalUrl: req.originalUrl,
+    originalUrl: redactPaymentCallbackUrl(req.originalUrl),
     ip: req.ip,
     userAgent: req.headers["user-agent"] || null,
     query: {
@@ -863,12 +734,13 @@ function logPaymentCallbackSnapshot(req) {
   const snapshot = {
     at: new Date().toISOString(),
     method: req.method,
-    originalUrl: req.originalUrl,
+    originalUrl: redactPaymentCallbackUrl(req.originalUrl),
     ip: req.ip,
     xForwardedFor: req.headers["x-forwarded-for"] || null,
     userAgent: req.headers["user-agent"] || null,
+    referer: redactPaymentCallbackUrl(req.headers.referer || req.headers.referrer || "") || null,
     headers: maskHeaders(req.headers),
-    query: req.query || {},
+    query: q,
     body: req.body || {},
   };
 
@@ -1031,7 +903,13 @@ export async function initPaymentOrder(req, res) {
       }
     }
     if (order.status === "paid") {
-      await deactivateOtherPaidSubscriptions(order.userId, order.id);
+      const deactivated = await deactivateOtherPaidSubscriptions(order.userId, order.id);
+      const aid = String(process.env.JPAYMENT_AID || "").trim();
+      await stopLegacyAutoCharges(deactivated.legacies, {
+        aid,
+        source: "payment/init-zero-charge",
+        expectedUserId: order.userId,
+      });
       await refreshAndSyncUserSubscriptionState(order.userId);
     }
 
@@ -1227,7 +1105,8 @@ export async function getPaymentResultByToken(req, res) {
 
     const order = await PaymentOrder.findOne({ where: { resultToken: token } });
     if (!order) return res.status(404).json({ error: "Result not found" });
-    if (order.resultTokenExpiresAt && new Date(order.resultTokenExpiresAt) < new Date()) {
+    const resultExpires = parseJstDateTime(order.resultTokenExpiresAt);
+    if (resultExpires && resultExpires < new Date()) {
       return res.status(410).json({ error: "Result token expired" });
     }
 
@@ -1335,7 +1214,7 @@ export async function paymentCallback(req, res) {
         rst,
       });
       let workOrder = order;
-      let legacyForStop = null;
+      let legaciesForStop = [];
       const isInitialPaymentResult = order.status === "pending";
       const incomingAcid = q.acid != null ? String(q.acid).trim() : "";
       const incomingGid = q.gid != null ? String(q.gid).trim() : "";
@@ -1352,7 +1231,7 @@ export async function paymentCallback(req, res) {
         await applyGatewayResultToOrder(order, q, { transaction });
         if (order.status === "paid") {
           const d = await deactivateOtherPaidSubscriptions(order.userId, order.id, transaction);
-          legacyForStop = d.legacy;
+          legaciesForStop = d.legacies || [];
         }
         workOrder = order;
       } else if (isSamePaidCallbackRetry) {
@@ -1365,8 +1244,9 @@ export async function paymentCallback(req, res) {
         await applyGatewayResultToOrder(order, q, { transaction });
         workOrder = order;
       }
-      if (!legacyForStop && rst === "1" && workOrder.status === "paid") {
-        legacyForStop = await findLegacyStopCandidate(order.userId, order.id, incomingAcid, transaction);
+      if (rst === "1" && workOrder.status === "paid") {
+        const extra = await findLegacyStopCandidate(order.userId, order.id, incomingAcid, transaction);
+        if (extra) legaciesForStop = [...legaciesForStop, extra];
       }
       const resultToken = await ensureResultToken(workOrder, { transaction });
       // getUserSubscriptionState → User.update: must run AFTER commit, not inside this transaction (avoids
@@ -1381,7 +1261,7 @@ export async function paymentCallback(req, res) {
         paymentCallbackPath,
         subscriptionSyncNeeded,
       });
-      return { order: workOrder, legacyForStop, resultToken, userId: workOrder.userId, subscriptionSyncNeeded };
+      return { order: workOrder, legaciesForStop, resultToken, userId: workOrder.userId, subscriptionSyncNeeded };
     });
 
     if (!callbackPayload) {
@@ -1401,11 +1281,9 @@ export async function paymentCallback(req, res) {
     }
 
     const aid = String(process.env.JPAYMENT_AID || "").trim();
-    const { legacyForStop } = callbackPayload || {};
     if (callbackPayload && rst === "1") {
-      await stopLegacyAutoCharge({
+      await stopLegacyAutoCharges(callbackPayload.legaciesForStop, {
         aid,
-        legacyForStop,
         source: "payment/callback",
         expectedUserId: callbackPayload.userId,
       });
@@ -1419,84 +1297,39 @@ export async function paymentCallback(req, res) {
   }
 }
 
-/** Browser return URL from J-Payment: update order then redirect FE with opaque result token */
+/**
+ * Browser return URL from J-Payment.
+ * Unauthenticated — must not change order or payment state.
+ * Only the server-to-server callback (verifyJPaymentCallbackQuerySecret) may do that.
+ * This route looks the order up so the frontend can show the result token.
+ */
 export async function paymentReturn(req, res) {
   try {
     logPaymentCallbackSnapshot(req);
     const q = req.query || {};
     const cod = q.cod != null ? String(q.cod).trim() : "";
     const uid = q.uid != null ? String(q.uid).trim() : "";
-    const hasGatewayResult = q.gid != null && q.rst != null;
 
-    const returnPayload = await sequelize.transaction(async (transaction) => {
-      let order = null;
-      if (cod) {
-        order = await PaymentOrder.findOne({
-          where: { cod },
-          transaction,
-          lock: transaction.LOCK.UPDATE,
-        });
-      }
-      if (!order && uid) {
-        order = await PaymentOrder.findOne({
-          where: { uidToken: uid },
-          transaction,
-          lock: transaction.LOCK.UPDATE,
-        });
-      }
-      if (!order) return null;
-
-      const statusBefore = order.status;
-      let legacyForStop = null;
-      if (hasGatewayResult) {
-        await applyGatewayResultToOrder(order, q, { transaction });
-        if (order.status === "paid") {
-          const d = await deactivateOtherPaidSubscriptions(order.userId, order.id, transaction);
-          legacyForStop = d.legacy;
-        }
-        if (!legacyForStop && String(q.rst || "").trim() === "1" && order.status === "paid") {
-          legacyForStop = await findLegacyStopCandidate(order.userId, order.id, q.acid, transaction);
-        }
-      } else {
-        console.warn("[PAYMENT RETURN] missing gid/rst; keep current order status", {
-          cod: order.cod,
-          uid: order.uidToken,
-        });
-      }
-      const resultToken = await ensureResultToken(order, { transaction });
-      // Sync User.subscriptionPlan sau commit: tránh lock timeout trong transaction; skip nếu đã paid từ trước (idempotent)
-      const subscriptionSyncNeeded = hasGatewayResult && statusBefore === "pending";
-      return {
-        resultToken,
-        legacyForStop,
-        orderPaidWithGateway: hasGatewayResult && order.status === "paid",
-        userId: order.userId,
-        subscriptionSyncNeeded,
-      };
-    });
-    if (!returnPayload?.resultToken) {
-      return res.status(404).send("order not found");
-    }
-
-    if (returnPayload.subscriptionSyncNeeded && returnPayload.userId) {
-      try {
-        await refreshAndSyncUserSubscriptionState(returnPayload.userId);
-      } catch (syncErr) {
-        console.error("❌ [PAYMENT RETURN] post-commit subscription sync failed (non-fatal)", syncErr);
-      }
-    }
-
-    const { resultToken, legacyForStop, orderPaidWithGateway } = returnPayload;
-    const aid = String(process.env.JPAYMENT_AID || "").trim();
-    if (orderPaidWithGateway && String(q.rst || "").trim() === "1") {
-      await stopLegacyAutoCharge({
-        aid,
-        legacyForStop,
-        source: "payment/return",
-        expectedUserId: returnPayload.userId,
+    if (q.gid != null || q.rst != null) {
+      console.log("[PAYMENT RETURN] ignored gateway result on browser return; order state changes only via /api/payment/callback", {
+        cod: cod || null,
+        hasGid: q.gid != null,
+        rst: q.rst != null ? String(q.rst) : null,
       });
     }
 
+    let order = null;
+    if (cod) {
+      order = await PaymentOrder.findOne({ where: { cod } });
+    }
+    if (!order && uid) {
+      order = await PaymentOrder.findOne({ where: { uidToken: uid } });
+    }
+    if (!order) {
+      return res.status(404).send("order not found");
+    }
+
+    const resultToken = await ensureResultToken(order);
     const feReturn = getFrontendReturnUrl();
     if (!feReturn) {
       return res.status(200).json({

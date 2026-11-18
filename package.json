@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node app.js",
+    "test": "node --test",
     "dev": "nodemon app.js",
     "migrate:add-flight-fields": "node scripts/migrate_add_flight_fields.js",
     "migrate:add-maintenance-detail": "node scripts/migrate_add_maintenance_detail_enum.js",
