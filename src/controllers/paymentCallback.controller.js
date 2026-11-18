@@ -10,6 +10,7 @@ import {
 import { buildAutoRenewResultPatch } from "../utils/autoRenewRst.js";
 import { stopLegacyAutoCharges } from "../utils/autoChargeStop.js";
 import { parseJstDateTime } from "../utils/jstDate.js";
+import { jpayLinkCheckoutUrl } from "../utils/jpaymentEndpoints.js";
 import { toPaymentProfilePayload } from "../utils/paymentProfile.js";
 import { refreshAndSyncUserSubscriptionState } from "../middlewares/subscription.middleware.js";
 import { getMinOnlineChargeJpy, getPlanAmount, resolveBilledBaseForProration } from "../utils/paymentPricing.js";
@@ -48,7 +49,6 @@ function buildSubscriptionId(userId) {
   return `SUB_${userId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const JPAY_LINK_URL = "https://credit.j-payment.co.jp/link/creditcard";
 const TRANSIENT_ORDER_KEEP_MINUTES = 30;
 const UPGRADE_RENEWAL_GRACE_WINDOW_MS = 5 * 60 * 1000;
 const LEGACY_IID_PLAN_MAP = {
@@ -1058,9 +1058,10 @@ export async function checkoutByUid(req, res) {
     const ac4LinkVal =
       (order.ac4 ? formatAc4ForJpaymentLink(order.ac4) : null) ??
       (order.planType === "trial" ? formatAc4SlashFromTrialAc4StylePeriodEnd(order.periodEndAt) : null);
+    const linkUrl = jpayLinkCheckoutUrl();
     console.log("[JPAY CHECKOUT] submit", {
       aid,
-      endpoint: JPAY_LINK_URL,
+      endpoint: linkUrl,
       cod: order.cod,
       mode: "NO_PRODUCT_REGISTRATION",
       expectedAmount: order.expectedAmount,
@@ -1071,7 +1072,7 @@ export async function checkoutByUid(req, res) {
     const html = `<!doctype html>
 <html><head><meta charset="utf-8"><title>Redirecting...</title></head>
 <body>
-  <form id="jpayCheckoutForm" action="${JPAY_LINK_URL}" method="POST" style="display:none;">
+  <form id="jpayCheckoutForm" action="${linkUrl}" method="POST" style="display:none;">
     <input type="hidden" name="aid" value="${escapeHtml(aid)}" />
     <input type="hidden" name="am" value="${escapeHtml(order.expectedAmount || 0)}" />
     <input type="hidden" name="uid" value="${escapeHtml(order.uidToken || "")}" />

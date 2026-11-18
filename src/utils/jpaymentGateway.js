@@ -1,8 +1,31 @@
 /**
  * J-Payment server-to-server APIs (fixed server IP required; browser → ER003).
  * @see クレジットカード (実売上・取消・再オーソリ) 接続仕様書
+ *
+ * Hosts come from jpaymentEndpoints (real credit.j-payment.co.jp unless JPAYMENT_MOCK / JPAYMENT_BASE_URL).
  */
 
+import {
+  jpayAutoChargeStopUrl,
+  jpayGatewayUrl,
+  jpayLinkAutoChargeUpdateUrl,
+  jpayReAuthUrl,
+} from "./jpaymentEndpoints.js";
+
+export function getJPayGatewayUrl() {
+  return jpayGatewayUrl();
+}
+export function getJPayReAuthUrl() {
+  return jpayReAuthUrl();
+}
+export function getJPayAutoChargeStopUrl() {
+  return jpayAutoChargeStopUrl();
+}
+export function getJPayLinkAutoChargeUpdateUrl() {
+  return jpayLinkAutoChargeUpdateUrl();
+}
+
+/** Real-gateway defaults. Call the getters above so a local mock can be opted in. */
 export const JPAY_GATEWAY_URL = "https://credit.j-payment.co.jp/gateway/gateway.aspx";
 export const JPAY_RE_AUTH_URL = "https://credit.j-payment.co.jp/gateway/re_auth.aspx";
 export const JPAY_AUTO_CHARGE_STOP_URL = "https://credit.j-payment.co.jp/gateway/acsgate.aspx";
@@ -82,7 +105,7 @@ function buildGatewayBody({ aid, jb, tid, rt = "1", extra = {} }) {
  */
 export async function postGatewayTransaction({ aid, jb, tid, rt = "1", extra = {} }) {
   const body = buildGatewayBody({ aid, jb, tid, rt, extra });
-  const response = await fetchGatewayForm(JPAY_GATEWAY_URL, body);
+  const response = await fetchGatewayForm(getJPayGatewayUrl(), body);
   const text = await response.text();
   const parsed = parseGatewayRt1Response(text);
   return {
@@ -287,7 +310,7 @@ export async function stopJPaymentAutoCharge({ aid, acid }) {
   let response;
   let text = "";
   try {
-    response = await fetchGatewayForm(JPAY_AUTO_CHARGE_STOP_URL, body);
+    response = await fetchGatewayForm(getJPayAutoChargeStopUrl(), body);
     text = await response.text();
   } catch (err) {
     const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";

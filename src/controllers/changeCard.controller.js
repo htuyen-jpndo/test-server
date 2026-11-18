@@ -1,7 +1,7 @@
 import { PaymentOrder } from "../models/paymentOrder.model.js";
 import { getUserSubscriptionState } from "../middlewares/subscription.middleware.js";
 import { PAYMENT_METHOD } from "../utils/paymentEnums.js";
-import { JPAY_LINK_AUTO_CHARGE_UPDATE_URL } from "../utils/jpaymentGateway.js";
+import { jpayLinkAutoChargeUpdateUrl } from "../utils/jpaymentEndpoints.js";
 
 async function resolveActiveCreditCardOrder(userId) {
   const subscription = await getUserSubscriptionState(userId, { forceRefresh: true });
@@ -84,7 +84,7 @@ export async function initChangeCard(req, res) {
       return res.status(500).json({ error: "JPAYMENT_AID is not set" });
     }
 
-    const changeCardUrl = `${JPAY_LINK_AUTO_CHARGE_UPDATE_URL}?aid=${encodeURIComponent(aid)}`;
+    const changeCardUrl = `${jpayLinkAutoChargeUpdateUrl()}?aid=${encodeURIComponent(aid)}`;
 
     return res.json({
       message: "Open changeCardUrl on J-Payment to update the credit card for auto-renew",

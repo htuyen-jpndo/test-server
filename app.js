@@ -27,6 +27,7 @@ import { requireActiveSubscription } from "./src/middlewares/subscription.middle
 import { startBankFreeAutoRenewWorker } from "./src/jobs/bankFreeAutoRenew.worker.js";
 import { startAutoChargeStopRetryWorker } from "./src/jobs/autoChargeStopRetry.worker.js";
 import { assertJPaymentCallbackSecretConfigured } from "./src/utils/paymentNotify.js";
+import { assertJPaymentEndpointsAllowed } from "./src/utils/jpaymentEndpoints.js";
 // import "./models/index.js"; 
 import "./src/models/index.js"; 
 
@@ -178,6 +179,7 @@ const PORT = Number(process.env.PORT) || 5000;
 const startServer = () => {
   try {
     assertJPaymentCallbackSecretConfigured();
+    assertJPaymentEndpointsAllowed();
   } catch (err) {
     console.error("❌", err.message);
     process.exit(1);
