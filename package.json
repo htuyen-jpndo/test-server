@@ -1,0 +1,36 @@
+{
+  "name": "drone-flight-server",
+  "version": "1.0.0",
+  "description": "Backend API for Drone Flight Record System (Express + MySQL)",
+  "main": "app.js",
+  "type": "module",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js",
+    "migrate:add-flight-fields": "node scripts/migrate_add_flight_fields.js",
+    "migrate:add-maintenance-detail": "node scripts/migrate_add_maintenance_detail_enum.js",
+    "migrate:add-user-role": "node scripts/migrate_add_user_role.js",
+    "migrate:sync-subscription-plan": "node scripts/sync_user_subscription_plan.js",
+    "create:admin": "node scripts/create_admin_user.js",
+    "db:wipe": "node scripts/wipe_database.js",
+    "erd:png": "node scripts/generateERD.js"
+  },
+  "keywords": ["express", "mysql", "sequelize", "drone", "api", "flight"],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "geoip-lite": "^1.4.10",
+    "jsonwebtoken": "^9.0.3",
+    "mysql2": "^3.10.0",
+    "nodemailer": "^7.0.11",
+    "sequelize": "^6.37.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0",
+    "@mermaid-js/mermaid-cli": "^11.0.0"
+  }
+}
