@@ -28,7 +28,7 @@ Open `http://127.0.0.1:5099` for auto-charge buttons and the acsgate / refund fa
 
 | What you want to try | What to do |
 | --- | --- |
-| Checkout form (`am`, `actp`, `acam`, `ac4`, `cod`, `uid`, …) | Init a card checkout in the API and open its `checkoutUrl`. The auto-post lands on the mock page and lists those fields. |
+| Checkout form (`am`, `actp`, `acam`, `ac1`, `ac4`, `cod`, `uid`, …) | Init a card checkout in the API and open its `checkoutUrl`. The auto-post lands on the mock page and lists those fields. Monthly and yearly send `ac1` (day 1–30, or `99` for the 31st / last day of the month). Weekly trial does not. Period ends stay on that original day: Jan 31 → Feb 28/29 → Mar 31, not Mar 28. |
 | Success: server callback, then browser return | **Pay success (rst=1)**. The mock GETs `/api/payment/callback/<secret>?gid&rst&acid&cod&am&uid…`, then redirects the browser to `/api/payment/return` with the same payment fields and **no secret**. The return must not be what marks the order paid. |
 | Forged paid return | **Browser return only**. No kickback is sent. The order stays pending. |
 | Initial failure | **Pay fail (rst=2)**. |

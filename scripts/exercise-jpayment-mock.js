@@ -210,6 +210,10 @@ async function main() {
   assert(form.fields.am === "1320", `am ${form.fields.am}`);
   assert(form.fields.actp === "4", `actp ${form.fields.actp}`);
   assert(form.fields.acam === "1320", `acam ${form.fields.acam}`);
+  const { jpaymentAc1Code } = await import("../src/utils/subscriptionRenewalPeriod.js");
+  const expectedAc1 = jpaymentAc1Code(init.json.order.periodStartAt, "monthly");
+  assert(form.fields.ac1 === expectedAc1, `ac1 ${form.fields.ac1} expected ${expectedAc1}`);
+  assert(!trialForm.fields.ac1, "trial checkout must not send ac1");
   assert(form.fields.cod.startsWith("ORD_"), `cod ${form.fields.cod}`);
   assert(form.fields.uid.length > 8, "missing uid");
   const posted = await fetch(form.action, {

@@ -3,7 +3,10 @@ import { sequelize } from "../config/db.js";
 import { PaymentOrder } from "../models/paymentOrder.model.js";
 import { PAYMENT_METHOD } from "../utils/paymentEnums.js";
 import { getPlanAmount } from "../utils/paymentPricing.js";
-import { buildNextPeriodFromPeriodEnd } from "../utils/subscriptionRenewalPeriod.js";
+import {
+  buildNextPeriodFromPeriodEnd,
+  resolveBillingAnchorDate,
+} from "../utils/subscriptionRenewalPeriod.js";
 import { refreshAndSyncUserSubscriptionState } from "../middlewares/subscription.middleware.js";
 
 function buildManualRenewCod(sourceOrder) {
@@ -93,7 +96,8 @@ export async function renewBankFreeOrderOnce(sourceOrder) {
       return { ok: true, reason: "stale_expired", orderId: existingRenewal.id };
     }
 
-    const period = buildNextPeriodFromPeriodEnd(locked.planType, locked.periodEndAt);
+    const billingAnchor = await resolveBillingAnchorDate(locked, { transaction });
+    const period = buildNextPeriodFromPeriodEnd(locked.planType, locked.periodEndAt, billingAnchor);
     if (!period) {
       return { ok: false, reason: "invalid_period" };
     }

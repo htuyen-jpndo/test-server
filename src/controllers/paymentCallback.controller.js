@@ -11,6 +11,12 @@ import { buildAutoRenewResultPatch } from "../utils/autoRenewRst.js";
 import { stopLegacyAutoCharges } from "../utils/autoChargeStop.js";
 import { parseJstDateTime } from "../utils/jstDate.js";
 import { jpayLinkCheckoutUrl } from "../utils/jpaymentEndpoints.js";
+import {
+  buildFirstPeriod,
+  buildNextPeriodFromPeriodEnd,
+  jpaymentAc1Code,
+  resolveBillingAnchorDate,
+} from "../utils/subscriptionRenewalPeriod.js";
 import { toPaymentProfilePayload } from "../utils/paymentProfile.js";
 import { refreshAndSyncUserSubscriptionState } from "../middlewares/subscription.middleware.js";
 import { getMinOnlineChargeJpy, getPlanAmount, resolveBilledBaseForProration } from "../utils/paymentPricing.js";
@@ -231,55 +237,8 @@ function parseDateInputToDate(raw) {
   return parseJstDateTime(raw);
 }
 
-function lastDayOfMonth(year, month) {
-  return new Date(year, month, 0).getDate();
-}
-
-function shiftJstYearMonth(year, month, deltaMonths) {
-  let y = year;
-  let m = month + deltaMonths;
-  while (m > 12) {
-    m -= 12;
-    y += 1;
-  }
-  while (m < 1) {
-    m += 12;
-    y -= 1;
-  }
-  return { year: y, month: m };
-}
-
-/** Same calendar day next month; clamp to last day if target month is shorter (e.g. Jan 31 → Feb 28). */
-function addMonthsInJst(date, months) {
-  const p = jstPartsFromDate(date);
-  const { year, month } = shiftJstYearMonth(p.year, p.month, months);
-  const day = Math.min(p.day, lastDayOfMonth(year, month));
-  return dateFromJstParts(year, month, day, p.hour, p.minute, p.second);
-}
-
-/** Same calendar day next year; clamp for leap-year edge (e.g. Feb 29 2024 → Feb 28 2025). */
-function addYearsInJst(date, years) {
-  const p = jstPartsFromDate(date);
-  const year = p.year + years;
-  const day = Math.min(p.day, lastDayOfMonth(year, p.month));
-  return dateFromJstParts(year, p.month, day, p.hour, p.minute, p.second);
-}
-
-function addDaysInJst(date, days) {
-  const p = jstPartsFromDate(date);
-  return dateFromJstParts(p.year, p.month, p.day + days, p.hour, p.minute, p.second);
-
-}
-
 function buildPeriodFromPaidAt(planType, paidAt) {
-  const start = parseDateInputToDate(paidAt);
-  if (!start) return null;
-  const end = planType === "yearly"
-    ? addYearsInJst(start, 1)
-    : planType === "trial"
-      ? addDaysInJst(start, 7)
-      : addMonthsInJst(start, 1);
-  return { start, end };
+  return buildFirstPeriod(planType, paidAt);
 }
 
 function recurringCycleCodeFromPlan(planType) {
@@ -505,7 +464,12 @@ async function handleAutoRenewResultCallback(order, q, transaction) {
     lock: transaction.LOCK.UPDATE,
   });
   const sourceOrder = latestOrder || order;
-  const period = buildPeriodFromPaidAt(sourceOrder.planType, asValidDate(sourceOrder.periodEndAt) || new Date());
+  const billingAnchor = await resolveBillingAnchorDate(sourceOrder, { transaction });
+  const period = buildNextPeriodFromPeriodEnd(
+    sourceOrder.planType,
+    sourceOrder.periodEndAt,
+    billingAnchor
+  );
   if (!period) return order;
 
   const existingByGid = gid
@@ -853,12 +817,7 @@ export async function initPaymentOrder(req, res) {
     );
 
     const periodStartAt = now;
-    let periodEndAt =
-      planType === "monthly"
-        ? addMonthsInJst(now, 1)
-        : planType === "yearly"
-          ? addYearsInJst(now, 1)
-          : addDaysInJst(now, 7);
+    let periodEndAt = buildFirstPeriod(planType, now)?.end || null;
     if (ac4JstDayStart) {
       periodEndAt = ac4JstDayStart;
     }
@@ -1058,6 +1017,8 @@ export async function checkoutByUid(req, res) {
     const ac4LinkVal =
       (order.ac4 ? formatAc4ForJpaymentLink(order.ac4) : null) ??
       (order.planType === "trial" ? formatAc4SlashFromTrialAc4StylePeriodEnd(order.periodEndAt) : null);
+    // ac1 is the gateway's day-of-month for later charges (99 = last day). Weekly trial must omit it.
+    const ac1Code = autoRenewEnabled ? jpaymentAc1Code(order.periodStartAt || new Date(), order.planType) : null;
     const linkUrl = jpayLinkCheckoutUrl();
     console.log("[JPAY CHECKOUT] submit", {
       aid,
@@ -1067,6 +1028,7 @@ export async function checkoutByUid(req, res) {
       expectedAmount: order.expectedAmount,
       recurringAmount,
       ac4: ac4LinkVal || null,
+      ac1: ac1Code,
     });
 
     const html = `<!doctype html>
@@ -1084,6 +1046,7 @@ export async function checkoutByUid(req, res) {
     ${autoRenewEnabled ? `<input type="hidden" name="acam" value="${escapeHtml(recurringAmount)}" />` : ""}
     ${autoRenewEnabled ? `<input type="hidden" name="actx" value="0" />` : ""}
     ${autoRenewEnabled ? `<input type="hidden" name="acsf" value="0" />` : ""}
+    ${ac1Code ? `<input type="hidden" name="ac1" value="${escapeHtml(ac1Code)}" />` : ""}
     ${ac4LinkVal ? `<input type="hidden" name="ac4" value="${escapeHtml(ac4LinkVal)}" />` : ""}
     <input type="hidden" name="inm" value="${escapeHtml(displayProductName)}" />
     <input type="hidden" name="iid2" value="${escapeHtml(productRef)}" />
