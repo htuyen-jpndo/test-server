@@ -25,6 +25,9 @@ import { normalizeDoubleQuestionQuery } from "./src/middlewares/normalizeDoubleQ
 import { auth } from "./src/middlewares/auth.js";
 import { requireActiveSubscription } from "./src/middlewares/subscription.middleware.js";
 import { startBankFreeAutoRenewWorker } from "./src/jobs/bankFreeAutoRenew.worker.js";
+import { startAutoChargeStopRetryWorker } from "./src/jobs/autoChargeStopRetry.worker.js";
+import { assertJPaymentCallbackSecretConfigured } from "./src/utils/paymentNotify.js";
+import { assertJPaymentEndpointsAllowed } from "./src/utils/jpaymentEndpoints.js";
 // import "./models/index.js"; 
 import "./src/models/index.js"; 
 
@@ -164,7 +167,7 @@ async function ensureAdminExists() {
       password: hashedPassword,
       role: "admin",
     });
-    console.log("✅ Admin mặc định đã được tạo:", adminEmail, "/", adminPassword);
+    console.log("✅ Admin mặc định đã được tạo:", adminEmail);
   } catch (err) {
     console.error("⚠️ Không tạo được admin:", err.message);
     console.error(err.stack);
@@ -174,6 +177,14 @@ async function ensureAdminExists() {
 const PORT = Number(process.env.PORT) || 5000;
 
 const startServer = () => {
+  try {
+    assertJPaymentCallbackSecretConfigured();
+    assertJPaymentEndpointsAllowed();
+  } catch (err) {
+    console.error("❌", err.message);
+    process.exit(1);
+  }
+
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`🚀 Server listening on port ${PORT} (0.0.0.0)`);
   });
@@ -185,6 +196,7 @@ const startServer = () => {
       await sequelize.sync();
       await ensureAdminExists();
       startBankFreeAutoRenewWorker();
+      startAutoChargeStopRetryWorker();
       console.log("✅ Database ready");
     } catch (err) {
       console.error("❌ Database init failed:", err);

@@ -1,8 +1,31 @@
 /**
  * J-Payment server-to-server APIs (fixed server IP required; browser → ER003).
  * @see クレジットカード (実売上・取消・再オーソリ) 接続仕様書
+ *
+ * Hosts come from jpaymentEndpoints (real credit.j-payment.co.jp unless JPAYMENT_MOCK / JPAYMENT_BASE_URL).
  */
 
+import {
+  jpayAutoChargeStopUrl,
+  jpayGatewayUrl,
+  jpayLinkAutoChargeUpdateUrl,
+  jpayReAuthUrl,
+} from "./jpaymentEndpoints.js";
+
+export function getJPayGatewayUrl() {
+  return jpayGatewayUrl();
+}
+export function getJPayReAuthUrl() {
+  return jpayReAuthUrl();
+}
+export function getJPayAutoChargeStopUrl() {
+  return jpayAutoChargeStopUrl();
+}
+export function getJPayLinkAutoChargeUpdateUrl() {
+  return jpayLinkAutoChargeUpdateUrl();
+}
+
+/** Real-gateway defaults. Call the getters above so a local mock can be opted in. */
 export const JPAY_GATEWAY_URL = "https://credit.j-payment.co.jp/gateway/gateway.aspx";
 export const JPAY_RE_AUTH_URL = "https://credit.j-payment.co.jp/gateway/re_auth.aspx";
 export const JPAY_AUTO_CHARGE_STOP_URL = "https://credit.j-payment.co.jp/gateway/acsgate.aspx";
@@ -82,11 +105,7 @@ function buildGatewayBody({ aid, jb, tid, rt = "1", extra = {} }) {
  */
 export async function postGatewayTransaction({ aid, jb, tid, rt = "1", extra = {} }) {
   const body = buildGatewayBody({ aid, jb, tid, rt, extra });
-  const response = await fetch(JPAY_GATEWAY_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
+  const response = await fetchGatewayForm(getJPayGatewayUrl(), body);
   const text = await response.text();
   const parsed = parseGatewayRt1Response(text);
   return {
@@ -120,65 +139,141 @@ export function maskJPaymentAcid(acid) {
   return `${s.slice(0, 4)}***${s.slice(-2)}`;
 }
 
-function extractGatewayErCode(snippet) {
-  const m = String(snippet || "").match(/ER[:\s]*([A-Z0-9]+)/i);
-  if (m?.[1]) return m[1];
-  return String(snippet || "").includes("ER") ? "ER" : null;
-}
+const GATEWAY_TIMEOUT_MS_DEFAULT = 10000;
+
+/** J-Payment parameter / gateway errors are `ER` + 3 digits (ER003, ER024, …). */
+const JPAY_ER_CODE = /\bER(\d{3})\b/i;
 
 const STOP_ER_HINTS = {
   ER003: "Send acsgate from whitelisted server IP only (not browser/FE).",
+  ER024: "Auto-charge is already stopped.",
   ER051: "Invalid or unknown parameter — verify aid/acid/cmd=1.",
 };
 
-function resolveAutoRenewStopOutcome({ httpStatus, snippet, duplicateStop }) {
-  const responseSnippet = String(snippet || "").slice(0, 500) || null;
+export function getGatewayTimeoutMs() {
+  const n = Number(
+    process.env.JPAYMENT_GATEWAY_TIMEOUT_MS ||
+      process.env.JPAYMENT_RECURRING_TIMEOUT_MS ||
+      GATEWAY_TIMEOUT_MS_DEFAULT
+  );
+  if (!Number.isFinite(n) || n <= 0) return GATEWAY_TIMEOUT_MS_DEFAULT;
+  return n;
+}
 
-  if (duplicateStop) {
-    return {
-      ok: true,
-      reason: "already_stopped",
-      reasonDetail:
-        "Gateway response indicates auto-charge was already stopped (duplicate / 処理済 / 既に).",
-      errorCode: null,
-    };
-  }
+export function extractJPaymentErCode(text) {
+  const m = String(text || "").match(JPAY_ER_CODE);
+  return m ? `ER${m[1]}` : null;
+}
 
-  if (!responseSnippet) {
+/**
+ * Interpret acsgate.aspx body.
+ * Spec (サブスクペイ): success is the fixed 2-letter result `OK`.
+ * Empty body is not success. A bare "ER" substring is not an error code
+ * (`USER`, `ORDER`, `SERVER` must not be treated as gateway failures).
+ * ER024 means the auto-charge is already stopped.
+ */
+export function interpretAutoChargeStopBody(text, { httpStatus = 200 } = {}) {
+  const trimmed = String(text ?? "").trim();
+  const responseSnippet = trimmed.slice(0, 500) || null;
+  const httpOk = httpStatus >= 200 && httpStatus < 300;
+
+  if (!trimmed) {
     return {
       ok: false,
       reason: "empty_gateway_response",
       reasonDetail: "acsgate.aspx returned an empty body — cannot confirm stop.",
       errorCode: null,
+      duplicateStop: false,
+      responseSnippet: null,
     };
   }
 
-  const errorCode = extractGatewayErCode(responseSnippet);
+  if (isDuplicateStopResponse(trimmed)) {
+    return {
+      ok: true,
+      reason: "already_stopped",
+      reasonDetail:
+        "Gateway response indicates auto-charge was already stopped (duplicate / 処理済 / 既に).",
+      errorCode: extractJPaymentErCode(trimmed),
+      duplicateStop: true,
+      responseSnippet,
+    };
+  }
+
+  const errorCode = extractJPaymentErCode(trimmed);
+  if (errorCode === "ER024") {
+    return {
+      ok: true,
+      reason: "already_stopped",
+      reasonDetail: "J-Payment ER024: auto-charge is already stopped.",
+      errorCode,
+      duplicateStop: true,
+      responseSnippet,
+    };
+  }
   if (errorCode) {
-    const hint = STOP_ER_HINTS[errorCode] || "Check J-Payment acsgate (auto-charge stop) docs and merchant settings.";
+    const hint =
+      STOP_ER_HINTS[errorCode] ||
+      "Check J-Payment acsgate (auto-charge stop) docs and merchant settings.";
     return {
       ok: false,
       reason: "gateway_er",
-      reasonDetail: `J-Payment ${errorCode}: ${responseSnippet}. ${hint}`,
+      reasonDetail: `J-Payment ${errorCode}: ${trimmed}. ${hint}`,
       errorCode,
+      duplicateStop: false,
+      responseSnippet,
     };
   }
 
-  if (httpStatus < 200 || httpStatus >= 300) {
+  if (/^OK$/i.test(trimmed)) {
+    if (!httpOk) {
+      return {
+        ok: false,
+        reason: "http_error",
+        reasonDetail: `acsgate HTTP ${httpStatus}; body: ${trimmed}`,
+        errorCode: null,
+        duplicateStop: false,
+        responseSnippet,
+      };
+    }
+    return {
+      ok: true,
+      reason: "stopped",
+      reasonDetail: "acsgate cmd=1 returned OK.",
+      errorCode: null,
+      duplicateStop: false,
+      responseSnippet,
+    };
+  }
+
+  if (!httpOk) {
     return {
       ok: false,
       reason: "http_error",
-      reasonDetail: `acsgate HTTP ${httpStatus}; body: ${responseSnippet}`,
+      reasonDetail: `acsgate HTTP ${httpStatus}; body: ${trimmed}`,
       errorCode: null,
+      duplicateStop: false,
+      responseSnippet,
     };
   }
 
   return {
     ok: false,
     reason: "unknown_stop_failure",
-    reasonDetail: `Unexpected acsgate response (HTTP ${httpStatus}): ${responseSnippet}`,
+    reasonDetail: `Unexpected acsgate response (HTTP ${httpStatus}): ${trimmed}. Expected OK.`,
     errorCode: null,
+    duplicateStop: false,
+    responseSnippet,
   };
+}
+
+function fetchGatewayForm(url, body) {
+  return fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: body.toString(),
+    signal: AbortSignal.timeout(getGatewayTimeoutMs()),
+  });
 }
 
 /**
@@ -215,19 +310,18 @@ export async function stopJPaymentAutoCharge({ aid, acid }) {
   let response;
   let text = "";
   try {
-    response = await fetch(JPAY_AUTO_CHARGE_STOP_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: body.toString(),
-    });
+    response = await fetchGatewayForm(getJPayAutoChargeStopUrl(), body);
     text = await response.text();
   } catch (err) {
+    const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
     return {
       ok: false,
       attempted: true,
       skipped: false,
-      reason: "network_error",
-      reasonDetail: `Failed to reach acsgate.aspx: ${err?.message || String(err)}`,
+      reason: timedOut ? "timeout" : "network_error",
+      reasonDetail: timedOut
+        ? `acsgate.aspx timed out after ${getGatewayTimeoutMs()}ms`
+        : `Failed to reach acsgate.aspx: ${err?.message || String(err)}`,
       errorCode: null,
       httpStatus: null,
       status: null,
@@ -238,44 +332,15 @@ export async function stopJPaymentAutoCharge({ aid, acid }) {
     };
   }
 
-  const responseSnippet = String(text || "").slice(0, 500);
-  const duplicateStop = isDuplicateStopResponse(responseSnippet);
-  const httpStatus = response.status;
-  const hasErInBody = responseSnippet.includes("ER");
-
-  if ((response.ok && !hasErInBody) || duplicateStop) {
-    const successReason = duplicateStop ? "already_stopped" : "stopped";
-    const successDetail = duplicateStop
-      ? "Auto-charge already stopped at gateway (treated as success)."
-      : "acsgate cmd=1 completed successfully.";
-    return {
-      ok: true,
-      attempted: true,
-      skipped: false,
-      reason: successReason,
-      reasonDetail: successDetail,
-      errorCode: null,
-      httpStatus,
-      status: httpStatus,
-      responseSnippet: responseSnippet || null,
-      snippet: responseSnippet || null,
-      duplicateStop,
-      acidMasked,
-    };
-  }
-
-  const failure = resolveAutoRenewStopOutcome({ httpStatus, snippet: responseSnippet, duplicateStop });
+  const interpreted = interpretAutoChargeStopBody(text, { httpStatus: response.status });
   return {
-    ok: false,
     attempted: true,
     skipped: false,
-    duplicateStop: false,
-    httpStatus,
-    status: httpStatus,
-    responseSnippet: responseSnippet || null,
-    snippet: responseSnippet || null,
+    httpStatus: response.status,
+    status: response.status,
+    snippet: interpreted.responseSnippet,
     acidMasked,
-    ...failure,
+    ...interpreted,
   };
 }
 

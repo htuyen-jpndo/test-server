@@ -3,25 +3,14 @@ import { Op } from "sequelize";
 import { User } from "../models/user.model.js";
 import { PAYMENT_METHOD } from "../utils/paymentEnums.js";
 import { toTimestampWithTimeZone } from "../utils/time.js";
+import { parseJstDateTime } from "../utils/jstDate.js";
 
 const SUBSCRIPTION_CACHE_TTL_MS = 15 * 1000;
 const subscriptionCache = new Map();
 
-/** periodEndAt: date-only YYYY-MM-DD = hết ngày đó (khớp admin); datetime = đúng mốc đó. */
+/** periodEndAt: date-only YYYY-MM-DD = end of that JST day; datetime = that JST wall clock. */
 function parsePeriodEndAtForExpiry(raw) {
-  if (raw == null || raw === "") return null;
-  if (raw instanceof Date) {
-    return Number.isNaN(raw.getTime()) ? null : raw;
-  }
-  const s = String(raw).trim();
-  if (!s) return null;
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const d = new Date(`${s}T23:59:59.999`);
-    return Number.isNaN(d.getTime()) ? null : d;
-  }
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(s) ? s.replace(" ", "T") : s;
-  const d = new Date(normalized);
-  return Number.isNaN(d.getTime()) ? null : d;
+  return parseJstDateTime(raw, { endOfDayForDateOnly: true });
 }
 
 function isOrderExpired(order) {

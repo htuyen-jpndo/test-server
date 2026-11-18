@@ -4,7 +4,7 @@ import {
 } from "../middlewares/subscription.middleware.js";
 import { PaymentOrder } from "../models/paymentOrder.model.js";
 import { PAYMENT_METHOD } from "../utils/paymentEnums.js";
-import { stopJPaymentAutoCharge } from "../utils/jpaymentGateway.js";
+import { stopLegacyAutoCharge } from "../utils/autoChargeStop.js";
 
 function parseAutoRenewOrNull(raw) {
   if (raw === undefined || raw === null || raw === "") return null;
@@ -63,24 +63,33 @@ export async function setMyAutoRenew(req, res) {
     ) {
       const aid = String(process.env.JPAYMENT_AID || "").trim();
       const acid = String(activePaidOrder.recurringToken || "").trim();
-      if (!aid) {
-        return res.status(500).json({ error: "JPAYMENT_AID is not set" });
-      }
       if (!acid) {
         return res.status(400).json({ error: "No recurring token (acid) on active subscription" });
       }
 
-      const stopResult = await stopJPaymentAutoCharge({ aid, acid });
+      const stopResult = await stopLegacyAutoCharge({
+        aid,
+        legacyForStop: {
+          acid,
+          legacyOrderId: activePaidOrder.id,
+          userId: activePaidOrder.userId,
+        },
+        source: "subscription/set-auto-renew",
+        expectedUserId: userId,
+      });
       if (!stopResult.ok) {
         console.error("[AUTO_RENEW] stop auto-charge failed", {
           userId,
           orderId: activePaidOrder.id,
-          status: stopResult.status,
-          responseSnippet: stopResult.snippet,
+          status: stopResult.status ?? stopResult.httpStatus ?? null,
+          reason: stopResult.reason || null,
+          responseSnippet: stopResult.snippet || stopResult.responseSnippet || null,
+          retryLater: Boolean(stopResult.retryLater),
         });
         return res.status(502).json({
           error: "Failed to stop auto-renew at payment gateway",
-          gatewayStatus: stopResult.status,
+          gatewayStatus: stopResult.status ?? stopResult.httpStatus ?? null,
+          stopRetryScheduled: Boolean(stopResult.retryLater),
         });
       }
     }
