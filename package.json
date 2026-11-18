@@ -9,6 +9,7 @@
     "test": "node --test",
     "jpayment:mock": "node src/mock/jpaymentMockServer.js",
     "jpayment:exercise": "node scripts/exercise-jpayment-mock.js",
+    "audit:subscription-periods": "node scripts/audit_subscription_periods.js",
     "dev": "nodemon app.js",
     "migrate:add-flight-fields": "node scripts/migrate_add_flight_fields.js",
     "migrate:add-maintenance-detail": "node scripts/migrate_add_maintenance_detail_enum.js",

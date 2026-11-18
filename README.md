@@ -41,3 +41,15 @@ Open `http://127.0.0.1:5099` for auto-charge buttons and the acsgate / refund fa
 `npm test` covers the mock contract (callback secret, return URL, rst=3 then rst=1, acsgate bodies, cancel body, card change) and the production guard.
 
 `npm run jpayment:exercise` runs the API and the mock against a local MySQL/MariaDB (`DB_*` or the defaults in the script) and walks checkout, forged return, retry-then-success, card change, a failed stop, the stop-retry worker, and refund. It is not part of `npm test`.
+
+## Audit stored subscription periods
+
+`scripts/audit_subscription_periods.js` is read-only. It uses `DATABASE_URL` or `DB_*`, starts a read-only transaction, and only runs `SELECT`. It does not update rows.
+
+```bash
+npm run audit:subscription-periods
+npm run audit:subscription-periods -- --csv /tmp/subscription-audit.csv
+npm run audit:subscription-periods -- --format csv
+```
+
+It reports month-end drift (a later period end that is not the original billing day, such as Mar 28 instead of Mar 31), a stored start or end that is exactly 9 hours off the anchored time, paid card orders with auto-renew on and no `recurringToken`, and a `Users.subscriptionPlan` that does not match the latest unexpired paid order. Emails are masked (`a***@example.com`). The command prints a table, or CSV with `--format csv`.
